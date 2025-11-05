@@ -1,71 +1,101 @@
-// MERCY
+// HTTP/HTTPS Proxy Server
 
-const fastify = require("fastify");
+const http = require('http');
+const https = require('https');
+const net = require('net');
+const { URL } = require('url');
 
-const server = fastify();
+const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || '0.0.0.0';
 
-server.post("/stream/*", async (req, res) => {
-  const site = req.params['*'];
-  console.log(site)
-  if (!site.includes(".")){
-    res.send(JSON.stringify({
-        "error": "Invalid domain."
-    }))
-    return
-  }
-  else{
-    try {
-      const response = await fetch("https://" + site, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(req.body)
-      });
-      const data = await response.text();
-      res.type(response.headers.get('content-type') || 'text/plain');
-      res.send(data);
-    } catch (error) {
-      console.error(error);
-      res.send(JSON.stringify({
-        "error": "Failed to fetch data."
-      }));
-    }
+const server = http.createServer((req, res) => {
+  // Handle regular HTTP requests (non-CONNECT)
+  if (req.method !== 'CONNECT') {
+    handleHttpRequest(req, res);
+  } else {
+    // This shouldn't happen here, but handle it gracefully
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.end('Method Not Allowed');
   }
 });
 
-server.get("/default/*", async (req, res) => {
-  const site = req.params['*'];
-  if (!site.includes(".")){
-    res.send(JSON.stringify({
-        "error": "Invalid domain."
-    }))
-    return
-  }
-  else{
-    try {
-      const response = await fetch("https://" + site, {
-        headers: req.headers,
-        body: req.body
-      });
-      const data = await response.text();
-      res.type('text/html')
-      res.send(data);
-    } catch (error) {
-      console.error(error);
-      res.send(JSON.stringify({
-        "error": "Failed to fetch data."
-      }));
-    }
-  }
-});
+// Handle CONNECT method for HTTPS tunneling
+server.on('connect', (req, clientSocket, head) => {
+  const { port, hostname } = parseHostPort(req.url);
 
-server
-  .listen({ port: 8080, host: "0.0.0.0" })
-  .then((address) => {
-    console.log(`Server listening at ${address}`);
-  })
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
+  console.log(`CONNECT ${hostname}:${port}`);
+
+  const serverSocket = net.connect(port, hostname, () => {
+    clientSocket.write(
+      'HTTP/1.1 200 Connection Established\r\n' +
+      'Proxy-agent: Node.js-Proxy\r\n' +
+      '\r\n'
+    );
+    serverSocket.write(head);
+    serverSocket.pipe(clientSocket);
+    clientSocket.pipe(serverSocket);
   });
+
+  serverSocket.on('error', (err) => {
+    console.error(`Error connecting to ${hostname}:${port}`, err.message);
+    clientSocket.end();
+  });
+
+  clientSocket.on('error', (err) => {
+    console.error('Client socket error:', err.message);
+    serverSocket.end();
+  });
+});
+
+function handleHttpRequest(req, res) {
+  try {
+    const url = new URL(req.url);
+
+    console.log(`${req.method} ${url.href}`);
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: req.method,
+      headers: { ...req.headers }
+    };
+
+    // Remove proxy-specific headers
+    delete options.headers['proxy-connection'];
+    delete options.headers['proxy-authorization'];
+
+    // Ensure host header is correct
+    options.headers.host = url.host;
+
+    const protocol = url.protocol === 'https:' ? https : http;
+
+    const proxyReq = protocol.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('Proxy request error:', err.message);
+      res.writeHead(502, { 'Content-Type': 'text/plain' });
+      res.end('Bad Gateway');
+    });
+
+    req.pipe(proxyReq);
+
+  } catch (err) {
+    console.error('Error handling request:', err.message);
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad Request');
+  }
+}
+
+function parseHostPort(hostString) {
+  const [hostname, portStr] = hostString.split(':');
+  const port = portStr ? parseInt(portStr, 10) : 443;
+  return { hostname, port };
+}
+
+server.listen(PORT, HOST, () => {
+  console.log(`Proxy server listening at http://${HOST}:${PORT}`);
+});
